@@ -8,17 +8,19 @@ Find out whether a small learned correction lets a coarse 2D TMz Yee FDTD grid m
 ## Experiment
 - **Grids:** coarse 64² vs plain 256² Yee, both scored against a 512² reference.
 - **Reference:** 512² truth generated once (fp64 allowed here only) and cached.
-- **Baselines:** plain coarse Yee; best fixed linear energy-safe stencil at radius 1, 2, 3 (dispersion-optimized, after Tam & Webb). The hand-picked Bar-Sinai-style net is kept for the R1 record only.
-- **Search order:** random search first, then evolution; PSO for continuous knobs; NEAT/HyperNEAT for networks that map the local material layout to stencil weights.
+- **Comparisons, in order:** (1) plain coarse Yee; (2) best fixed linear energy-safe stencil at radius 1, 2, 3 (dispersion-optimized, after Tam & Webb), with cell-averaged \(\varepsilon\) (subpixel smoothing) in material scenes; (3) evolved networks mapping local material patches to curl and material weights. The hand-picked Bar-Sinai-style net is kept for the R1 record only.
+- **Order of work:** finish the vacuum tuned-stencil baseline, re-measure F-001 with the staggered energy, then build material scenes.
+- **Search:** random search first, then evolution; PSO for continuous knobs; NEAT for networks.
 - **Budget:** about 2,000 training steps per candidate on 64²; a few hundred candidates per method. Expected total: a few GPU-hours.
 
 ## Scoring
 - Error against the 512² reference on a held-out test set, with interface regions reported separately.
-- Energy drift measured with the staggered leapfrog energy \(U_n=\tfrac12(\varepsilon\|E^n\|^2+\mu\,H^{n-\frac12}\cdot H^{n+\frac12})\) for every method.
+- Energy drift measured with the staggered leapfrog energy \(U_n=\tfrac12(\varepsilon\|E^n\|^2+\mu\,H^{n-\frac12}\cdot H^{n+\frac12})\), weighted by the true \(\varepsilon,\mu\), for every method.
 - Phase error per wavelength on plane waves at 4, 8 and 16 coarse cells per wavelength.
-- Cost measured as bytes read per cell per step (including any weight table) and time, not FLOPs. Network size counts toward setup time only.
+- Reflection and transmission off a dielectric slab at several angles, against the analytic Fresnel answer.
+- Cost measured as bytes read per cell per step (including the weight table) and time, not FLOPs. Network size counts toward setup time only.
 - **Stability gate:** a candidate must survive 20,000 steps.
-- **Win condition:** a network must beat the best fixed linear stencil, not just coarse Yee.
+- **Win condition:** a network must beat comparison (2) at interfaces.
 
 The numbered gates (T-REF, T-STAB-1..4, T-TIME, T-KILL, ...) are defined in [TEST_SPEC.md](TEST_SPEC.md). Findings live in [FINDINGS.md](FINDINGS.md).
 
@@ -32,7 +34,7 @@ The numbered gates (T-REF, T-STAB-1..4, T-TIME, T-KILL, ...) are defined in [TES
 - Timing waits for an idle GPU (no other jobs sharing it).
 
 ## Kill criterion
-If no searched candidate beats the best fixed linear stencil on error at equal or lower measured cost, we stop and write up the negative result.
+If no searched network beats comparison (2) at interfaces at equal or lower measured cost, we stop and write up the negative result.
 
 ## Environment (logged with every result)
 | Item | Value |
@@ -60,20 +62,23 @@ Each result also records GPU clock, temperature, power state and commit hash.
 ### D1 (approved 2026-10-17): energy conserved by structure
 - The H update uses the exact transpose of the E-update operator (`conv_transpose2d` with the same kernel as `conv2d`), so the curl pair is skew-symmetric. No second kernel tied by a penalty.
 - Coefficients must be fixed in time: constants, or functions of \(\varepsilon,\mu\) only. Field-dependent coefficients break the guarantee and may only appear as an unconstrained arm that passes the drift test empirically.
-- Each candidate's stability limit is checked with an FFT of its stencil at the 4× time step (\(\Delta t\,\sigma_{\max} < 2\sqrt{\varepsilon\mu}\)); violations are rejected immediately.
+- Vacuum: each candidate's stability limit is checked with an FFT of its stencil at the 4× time step (\(\Delta t\,\sigma_{\max} < 2\sqrt{\varepsilon\mu}\)); violations are rejected immediately.
 - Long-wavelength consistency constraint \(\sum_j w_j\,(j+\tfrac12)=1/\Delta x\).
 - Conservation unit test (T-STAB-4) runs before any search: fixed coefficients must stay at roundoff, field-dependent ones must drift.
 - Fixed linear stencil baseline added at radius 1, 2, 3.
 
 ### D2 (decided by Alex 2026-10-17): move to materials
-In vacuum, Maxwell is linear and uniform, so a fixed stencil is close to optimal and leaves nothing for a network to learn. After the vacuum stencil baseline, the search moves to scenes with dielectric blocks and interfaces. Networks map the local material layout (\(\varepsilon,\mu\) around each cell) to that cell's stencil weights. Materials don't change during a run, so the weights are fixed in time and D1's guarantee holds.
-- The network runs once at setup, not per step.
-- Per-cell weights are stored as a 1-byte class index into a small table of unique weight sets; bulk cells share the vacuum stencil.
+In vacuum, Maxwell is linear and uniform, so a fixed stencil is close to optimal and leaves nothing for a network to learn. After the vacuum stencil baseline, the search moves to scenes with dielectric blocks and interfaces. Materials don't change during a run, so learned weights are fixed in time and the energy guarantee holds.
+- **Energy-safe form:** \(M_\varepsilon\dot E = C H\), \(M_\mu\dot H = -C^{\mathsf T}E\), with \(M_\varepsilon, M_\mu\) symmetric positive-definite, conserves \(U=\tfrac12(E^{\mathsf T}M_\varepsilon E+H^{\mathsf T}M_\mu H)\) exactly.
+- **What the network may learn:** a spatially varying curl \(C\) (H step always uses its exact transpose), and effective material weights (diagonal positive via softplus, or a small symmetric block as \(LL^{\mathsf T}\)). It may **not** output the E and H updates separately.
+- **Stability check:** FFT no longer applies; run ~20 power iterations on \(M_\varepsilon^{-1/2}CM_\mu^{-1/2}\) per scene and require \(\Delta t\,\sigma_{\max}<2\). Once per scene.
+- **Setup and storage:** the network runs once at setup. Hash each cell's local material neighborhood (\(\varepsilon,\mu\) within the stencil radius), run the network once per unique pattern, store a 1-byte pattern index per cell (16-bit if a scene exceeds 255 patterns). Never cluster the output weights; that would change what the network computed.
 
 ## Claims and sources
 - Learned discretizations for coarse grids: Bar-Sinai et al., *Learning data-driven discretizations for partial differential equations*, PNAS 2019, [arXiv:1808.04930](https://arxiv.org/abs/1808.04930).
 - Learned solvers on coarse grids for fluids: Kochkov et al., *Machine learning–accelerated computational fluid dynamics*, PNAS 2021, [arXiv:2102.01010](https://arxiv.org/abs/2102.01010).
 - Dispersion-relation-preserving finite differences: Tam & Webb, JCP 1993, [doi:10.1006/jcph.1993.1142](https://doi.org/10.1006/jcph.1993.1142).
+- Subpixel smoothing at interfaces: Farjadpour et al., Optics Letters 2006, [doi:10.1364/OL.31.002972](https://doi.org/10.1364/OL.31.002972).
 - NEAT: Stanley & Miikkulainen, *Evolving Neural Networks through Augmenting Topologies*, Evolutionary Computation 2002.
 - Random search as a strong NAS baseline: Li & Talwalkar, *Random Search and Reproducibility for NAS*, 2019, [arXiv:1902.07638](https://arxiv.org/abs/1902.07638).
 - WaveY-Net (learned Maxwell solver): link still needed.
