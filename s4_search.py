@@ -5,7 +5,9 @@ random   : designs sampled uniformly without replacement.
 evolution: regularized (aging) evolution, population 12, tournament 4; the child is a one-knob
            mutation of the tournament winner; the oldest member dies. Same budget as random.
 Scalar fitness (lower is better) for the tournament only:
-    log(err1000) + 0.25 * log(estimated cost);  infeasible = +inf.
+    log(err1000) + 0.25 * log(estimated cost);
+    infeasible but finite (drift > 1%) = 100 + log(drift), so selection still pushes toward
+    lower drift while nothing is feasible; blown up = +inf.
 The Pareto fronts themselves are computed later from (err, cost) without this scalarisation.
 """
 import json, math, os, random, sys, time
@@ -18,7 +20,9 @@ POPULATION, TOURNAMENT, COST_WEIGHT = 12, 4, 0.25
 
 def fitness(rec):
     if not rec["feasible"]:
-        return math.inf
+        if rec["blew_up_at"] is not None or rec["drift_mean"] != rec["drift_mean"]:
+            return math.inf
+        return 100.0 + math.log(rec["drift_mean"])
     return math.log(rec["err1000"]) + COST_WEIGHT * math.log(rec["est_s_per_unit_1024"])
 
 
