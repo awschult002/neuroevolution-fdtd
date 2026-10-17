@@ -1,10 +1,15 @@
-"""Stage 9 (D2): material baselines on val and test (random 25 / unseen shapes 10).
- (i)  coarse Yee 64^2 with cell-averaged eps; Yee 128^2/256^2 (restricted, eps averaged from 512^2)
- (ii) tuned fixed vacuum stencils r = 1, 2, 3 (from s3b) with cell-averaged eps
-Errors overall and on interface cells (ierr). Writes runs/mat_baselines.json."""
-import json, torch
+"""Stage 9 (D2): material baselines. VALIDATION only by default (the bar is frozen from validation);
+`python s9_mat_baselines.py test` scores the held-out test once at the very end.
+ (i)  coarse Yee 64^2 with cell-averaged eps (T-MAT-2: the one coarse-eps rule for every method);
+      Yee 128^2/256^2 (restricted, eps averaged from 512^2)
+ (ii) tuned fixed vacuum stencils, free (s3b) and D4-constrained (s3d), r = 1, 2, 3, with the same
+      cell-averaged eps (subpixel smoothing; Ez is tangential to every interface in TMz)
+Errors: all cells (err), +-2-cell edge band (ierr), bulk (berr). The bar = the baseline-(ii) stencil
+with the lowest validation edge-band err@1000; its family (free or D4) also provides the networks'
+base stencils. Writes runs/mat_baselines.json (+ runs/mat_bar.json)."""
+import json, sys, torch
 from fdtd.mateval import load_mat, score, rel_l2
-from fdtd.model import YeeStepper, FixedLinearStepper
+from fdtd.model import YeeStepper, FixedLinearStepper, D4FixedStepper
 
 
 def fixed(r):
@@ -16,18 +21,30 @@ def fixed(r):
     return m.eval()
 
 
+def d4(r):
+    m = D4FixedStepper(r).cuda()
+    m.load_state_dict(torch.load(f"runs/d4_r{r}.pt"))
+    return m.eval()
+
+
 def fine(split, n, sel):
     out = {}
     for k, s in enumerate(split["steps"]):
         if s > 0:
             t, p, m = split["yee512"][sel, k], split[f"yee{n}"][sel, k], split["mask"][sel]
-            out[f"err{s}"], out[f"ierr{s}"] = rel_l2(p, t), rel_l2(p, t, m)
+            out[f"err{s}"], out[f"ierr{s}"], out[f"berr{s}"] = rel_l2(p, t), rel_l2(p, t, m), rel_l2(p, t, ~m)
     return out
 
 
 def main():
-    res = {}
-    for name, sels in (("val", {"val": slice(None)}), ("test", {"test_random": slice(0, 25), "test_unseen": slice(25, 35)})):
+    which = sys.argv[1] if len(sys.argv) > 1 else "val"
+    path = "runs/mat_baselines.json"
+    res = json.load(open(path)) if which == "test" else {}
+    if which == "val":
+        sets = (("val", {"val": slice(None)}),)
+    else:
+        sets = (("test", {"test_random": slice(0, 25), "test_unseen": slice(25, 35), "test_extra": slice(35, 41)}),)
+    for name, sels in sets:
         split = load_mat(name)
         for tag, sel in sels.items():
             res[f"yee64_{tag}"] = score(YeeStepper(), split, sel)
@@ -35,10 +52,17 @@ def main():
                 res[f"yee{n}_{tag}"] = fine(split, n, sel)
             for r in (1, 2, 3):
                 res[f"fixed_r{r}_{tag}"] = score(fixed(r), split, sel)
+                res[f"d4_r{r}_{tag}"] = score(d4(r), split, sel)
             for k, v in res.items():
                 if k.endswith(tag):
                     print(k, json.dumps(v), flush=True)
-    json.dump(res, open("runs/mat_baselines.json", "w"), indent=1)
+    if which == "val":
+        cands = [f"{f}_r{r}" for f in ("fixed", "d4") for r in (1, 2, 3)]
+        best = min(cands, key=lambda c: res[c + "_val"]["ierr1000"])
+        json.dump({"bar": best, "family": best.split("_")[0], "val_ierr1000": res[best + "_val"]["ierr1000"]},
+                  open("runs/mat_bar.json", "w"), indent=1)
+        print("BAR", best, res[best + "_val"]["ierr1000"], flush=True)
+    json.dump(res, open(path, "w"), indent=1)
 
 
 if __name__ == "__main__":

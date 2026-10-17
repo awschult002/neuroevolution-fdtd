@@ -75,13 +75,27 @@ def patches(field, r):
 
 def apply_transpose(coeffs, field, r):
     """(A^T f)[j] = sum_k a_k(j-k) f[j-k], the adjoint of (A g)[i] = sum_k a_k(i) g[i+k].
-    coeffs: (B, k*k, n, n) in the same offset order as patches()."""
+    coeffs: (B, k*k, n, n) in the same offset order as patches().
+    This is a GATHER: output cell j reads neighbour i = j-k's field AND neighbour i's own weight
+    a_k(i) (torch.roll of the product a_k * f), never its own. No scatter-add / atomics, so it is
+    deterministic. Checked as an exact adjoint (<Ah, f> = <h, A^T f>) in s0b_material_conservation.py."""
     k = 2 * r + 1
     out = torch.zeros_like(field)
     for dx in range(-r, r + 1):
         for dy in range(-r, r + 1):
             a = coeffs[:, (dx + r) * k + (dy + r)]
             out = out + torch.roll(a * field, shifts=(dx, dy), dims=(-2, -1))
+    return out
+
+
+def broken_transpose(coeffs, field, r):
+    """NEGATIVE CONTROL ONLY: cell j applies its OWN stencil a_k(j) to f[j-k]. Equals the true
+    transpose when the stencil is the same everywhere (vacuum) and is wrong where it varies."""
+    k = 2 * r + 1
+    out = torch.zeros_like(field)
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            out = out + coeffs[:, (dx + r) * k + (dy + r)] * torch.roll(field, shifts=(dx, dy), dims=(-2, -1))
     return out
 
 
@@ -225,3 +239,69 @@ class FixedLinearStepper(nn.Module):
 
 def parameter_count(model):
     return sum(p.numel() for p in model.parameters())
+
+
+class D4FixedStepper(FixedLinearStepper):
+    """D4-constrained fixed paired stencil. A1 (d/dx acting on Hy, which sits at x-offset dx+1/2) is
+    odd about its half-cell axis, w(dx, dy) = -w(-1-dx, dy), and even along y, w(dx, dy) = w(dx, -dy);
+    A2 (= -d/dy on Hx) is its 90-degree rotation, A2(dx, dy) = -A1(dy, dx). So each A1 entry is a
+    paired difference p * (f[+] - f[-]). Free parameters: p(dx, dy) for dx = 0..r-1, dy = 0..r
+    (r(r+1) of them), with the consistency moment sum w (dx+1/2) = 1 enforced by projection
+    (sum w = 0 and sum w*dy = 0 hold by symmetry). Same conv2d / conv_transpose2d step as the parent."""
+
+    def __init__(self, radius):
+        super().__init__(radius)
+        r, k = radius, 2 * radius + 1
+        pairs = [(dx, dy) for dx in range(r) for dy in range(r + 1)]
+        basis = torch.zeros(k * k, len(pairs))
+        cons = torch.zeros(len(pairs))
+        for j, (dx, dy) in enumerate(pairs):
+            for sy in {dy, -dy}:
+                basis[(dx + r) * k + (sy + r), j] += 1.0
+                basis[(-1 - dx + r) * k + (sy + r), j] -= 1.0
+            cons[j] = (2 * dx + 1) * (1 if dy == 0 else 2)
+        p0 = torch.zeros(len(pairs))
+        p0[0] = 1.0                                     # Yee: p(0, 0) = 1
+        self.register_buffer("basis", basis)
+        self.register_buffer("p0", p0)
+        self.register_buffer("pproj", torch.eye(len(pairs)) - torch.outer(cons, cons) / cons.dot(cons))
+        del self.delta
+        self.dp = nn.Parameter(torch.zeros(len(pairs)))
+
+    def kernel(self):
+        k = 2 * self.radius + 1
+        a1 = (self.basis @ (self.p0 + self.pproj @ self.dp)).view(k, k)
+        a2 = -a1.T
+        return torch.stack([a1, a2])[None]
+
+    def rescale_to_stable(self, margin=0.98):
+        if COURANT * self.sigma_max() < 2.0:
+            return 1.0
+        raise RuntimeError("D4 stencil violates T-STAB-3; rejected")
+
+
+class RollFixedStepper(nn.Module):
+    """Runtime form of a trained fixed paired stencil, for timing: the same operator written as a sum
+    of shifted fields with constant weights (zero weights skipped), so torch.compile/Inductor fuses
+    each half-step into one Triton kernel instead of calling cuDNN conv + conv_transpose.
+    E step: Ez += C inv_eps sum w1[d] Hy[i+d] + w2[d] Hx[i+d];  H step: Hy[j] -= C sum w1[d] Ez[j-d]."""
+
+    def __init__(self, fixed_stepper):
+        super().__init__()
+        r = fixed_stepper.radius
+        w = fixed_stepper.kernel().detach().cpu()[0]
+        self.terms = [[(dx, dy, float(w[c, dx + r, dy + r])) for dx in range(-r, r + 1) for dy in range(-r, r + 1)
+                       if float(w[c, dx + r, dy + r]) != 0.0] for c in range(2)]
+
+    def step(self, ez, hx, hy, inv_eps):
+        acc = 0.0
+        for c, field in ((0, hy), (1, hx)):
+            for dx, dy, w in self.terms[c]:
+                acc = acc + w * torch.roll(field, shifts=(-dx, -dy), dims=(-2, -1))
+        ez = ez + COURANT * inv_eps * acc
+        th, tx = 0.0, 0.0
+        for dx, dy, w in self.terms[0]:
+            th = th + w * torch.roll(ez, shifts=(dx, dy), dims=(-2, -1))
+        for dx, dy, w in self.terms[1]:
+            tx = tx + w * torch.roll(ez, shifts=(dx, dy), dims=(-2, -1))
+        return ez, hx - COURANT * tx, hy - COURANT * th

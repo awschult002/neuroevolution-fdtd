@@ -63,6 +63,65 @@ def tied_step(ez, hx, hy, a, inv_m, r):
     return ez, hx, hy
 
 
+def _shift_flip(a, dim):
+    """b[i] = a[2r-1-i] along dim (offset d -> -1-d), assuming a[2r] = 0 (support mask)."""
+    return torch.roll(torch.flip(a, dims=(dim,)), -1, dims=(dim,))
+
+
+def transform_stencils(s, t, mx, my):
+    """Stencils s (n, 2, k, k) = (A1 on Hy, A2 on Hx) for a pattern P, mapped to the pattern
+    My^my(Mx^mx(T^t(P)))^-1 ... concretely: returns My^my Mx^mx T^t applied (in that order: T first)
+    to the stencil pair, where for the geometry operations
+      T  (swap x,y):  A1' = -A2^T,  A2' = -A1^T
+      Mx (x -> -x) :  A1'(dx,dy) = -A1(-1-dx, dy),  A2'(dx,dy) = A2(-dx, dy)
+      My (y -> -y) :  A1'(dx,dy) = A1(dx, -dy),     A2'(dx,dy) = -A2(dx, -1-dy)
+    (derived from Hx = -dEz/dy, Hy = dEz/dx; checked by the equivariance test in s0b)."""
+    a1, a2 = s[:, 0], s[:, 1]
+    if t:
+        a1, a2 = -a2.transpose(-2, -1), -a1.transpose(-2, -1)
+    if mx:
+        a1, a2 = -_shift_flip(a1, -2), torch.flip(a2, dims=(-2,))
+    if my:
+        a1, a2 = torch.flip(a1, dims=(-1,)), -_shift_flip(a2, -1)
+    return torch.stack([a1, a2], dim=1)
+
+
+def transform_stencils_forward(s, t, mx, my):
+    """Stencil counterpart of the pattern operation T^t(Mx^mx(My^my(P))): My first, then Mx, then T."""
+    return transform_stencils(transform_stencils(transform_stencils(s, 0, 0, my), 0, mx, 0), t, 0, 0)
+
+
+def pattern_transforms(pat, p):
+    """(8, N, q*q): T^t(Mx^mx(My^my(P))) for g = 4t + 2mx + my."""
+    q = 2 * p + 1
+    x = pat.view(-1, q, q)
+    out = []
+    for t in (0, 1):
+        for mx in (0, 1):
+            for my in (0, 1):
+                y = x
+                if my:
+                    y = torch.flip(y, dims=(2,))
+                if mx:
+                    y = torch.flip(y, dims=(1,))
+                if t:
+                    y = y.transpose(1, 2)
+                out.append(y.reshape(-1, q * q))
+    return torch.stack(out)
+
+
+def canonicalize(pat, p):
+    """pat: (N, (2p+1)^2) eps patches. Returns canonical patches under D4 and, per cell, the
+    group element g = 4t + 2mx + my with canonical = T^t(Mx^mx(My^my(pattern)))."""
+    q = 2 * p + 1
+    key_vec = torch.linspace(1.0, 2.0, q * q, device=pat.device, dtype=torch.float64)
+    cands = pattern_transforms(pat, p)                            # (8, N, q*q)
+    keys = (cands.double() * key_vec).sum(-1)                     # deterministic order key
+    g = keys.argmin(dim=0)
+    canon = cands[g, torch.arange(pat.shape[0], device=pat.device)]
+    return canon, g
+
+
 class MaterialNet(nn.Module):
     def __init__(self, design, base_kernel):
         """base_kernel: (2, k*k) tuned fixed vacuum stencils of radius design.stencil_radius."""
@@ -79,14 +138,25 @@ class MaterialNet(nn.Module):
         self.mlp = nn.Sequential(*layers, last)
         self.register_buffer("base", base_kernel.clone().float())
         self.register_buffer("proj", consistency_projector(design.stencil_radius))
+        r, k = design.stencil_radius, 2 * design.stencil_radius + 1
+        support = torch.ones(2, k, k)
+        support[0, -1, :] = 0.0     # A1 at dx = +r has no mirror partner (Hy offsets are dx + 1/2)
+        support[1, :, -1] = 0.0     # A2 at dy = +r likewise
+        self.register_buffer("support", support.view(2, k * k))
 
     def classes(self, eps):
-        """Exact pattern hashing of the network input. Returns (unique patterns, per-cell index)."""
+        """Exact hashing of the network INPUT, canonicalised under D4 (rotations/reflections).
+        Returns unique canonical patterns, per-cell canonical index, per-cell group element g, and the
+        per-cell runtime class index over unique (pattern, g) pairs (uint8, int16 if > 255)."""
         b, h, w = eps.shape
         pat = patches(torch.log(eps), self.design.eps_radius).permute(0, 2, 3, 1).reshape(b * h * w, -1)
-        uniq, inv = torch.unique(pat, dim=0, return_inverse=True)
-        dtype = torch.uint8 if len(uniq) <= 255 else torch.int16
-        return uniq, inv.view(b, h, w).to(dtype)
+        canon, g = canonicalize(pat, self.design.eps_radius)
+        uniq, inv = torch.unique(canon, dim=0, return_inverse=True)
+        pair = inv * 8 + g
+        _, cls = torch.unique(pair, return_inverse=True)
+        n_cls = int(cls.max().item()) + 1
+        dtype = torch.uint8 if n_cls <= 255 else torch.int16
+        return uniq, inv.view(b, h, w), g.view(b, h, w), cls.view(b, h, w).to(dtype), n_cls
 
     def table(self, uniq):
         """Per-class stencils (n, 2, k*k) and M factors (n,)."""
@@ -98,20 +168,33 @@ class MaterialNet(nn.Module):
         da = out[:, :2 * k2].view(-1, 2, k2)
         if "C" not in self.design.outputs:
             da = da * 0
-        da = torch.einsum("cij,ncj->nci", self.proj, da)
+        da = torch.einsum("cij,ncj->nci", self.proj, da * self.support) * self.support
         factor = F.softplus(out[:, -1] + math.log(math.e - 1))
         if "M" not in self.design.outputs:
             factor = factor * 0 + 1
-        return self.base + da, factor
+        return da, factor            # correction in the canonical frame; base added per cell
+
+    def oriented_tables(self, uniq):
+        """(8, n, 2, k*k) corrections for every group element, plus (n,) M factors."""
+        da, f_tab = self.table(uniq)
+        k = 2 * self.design.stencil_radius + 1
+        da = da.view(-1, 2, k, k)
+        # A canonical pattern that is itself symmetric (stabiliser h with h(P) = P) must get a stencil
+        # with the same symmetry, or equivariance breaks: average over the stabiliser.
+        stab = (pattern_transforms(uniq, self.design.eps_radius) == uniq[None]).all(-1).to(da.dtype)   # (8, n)
+        sym = sum(stab[g][:, None, None, None] * transform_stencils_forward(da, g >> 2, (g >> 1) & 1, g & 1)
+                  for g in range(8))
+        da = sym / stab.sum(0)[:, None, None, None]
+        tabs = torch.stack([transform_stencils(da, g >> 2, (g >> 1) & 1, g & 1).reshape(-1, 2, k * k) for g in range(8)])
+        return tabs, f_tab
 
     def setup(self, eps):
         """Once per scene batch: per-cell stencils a (B, 2, k*k, h, w) and inv_m (B, h, w)."""
-        uniq, idx = self.classes(eps)
-        a_tab, f_tab = self.table(uniq)
-        i = idx.long()
-        a = a_tab[i].permute(0, 3, 4, 1, 2)
-        inv_m = 1.0 / (eps * f_tab[i])
-        return a, inv_m, len(uniq), idx.element_size()
+        uniq, inv, g, cls, n_cls = self.classes(eps)
+        tabs, f_tab = self.oriented_tables(uniq)
+        a = (self.base + tabs[g, inv]).permute(0, 3, 4, 1, 2)
+        inv_m = 1.0 / (eps * f_tab[inv])
+        return a, inv_m, n_cls, cls.element_size()
 
 
 class BoundMaterialStepper:
@@ -146,14 +229,18 @@ class IndexedMaterialStepper:
 
     def __init__(self, net, eps):
         with torch.no_grad():
-            uniq, idx = net.classes(eps)
-            a_tab, f_tab = net.table(uniq)
+            uniq, inv, g, cls, n_cls = net.classes(eps)
+            tabs, f_tab = net.oriented_tables(uniq)
+            # runtime table: one row per (pattern, orientation) class actually present
+            pair = (inv * 8 + g).flatten()
+            first = torch.zeros(n_cls, dtype=torch.long, device=eps.device)
+            first[cls.flatten().long()] = torch.arange(pair.numel(), device=eps.device)
+            self.a_tab = (net.base + tabs[g.flatten()[first], inv.flatten()[first]]).contiguous()
+            self.inv_m_tab = f_tab[inv.flatten()[first]].contiguous()
         self.r = net.design.stencil_radius
-        self.idx = idx
-        self.a_tab = a_tab.contiguous()
-        self.inv_m_tab = f_tab.contiguous()
+        self.idx = cls
         self.inv_eps = 1.0 / eps
-        self.n_classes = len(uniq)
+        self.n_classes = n_cls
 
     def step(self, ez, hx, hy, inv_eps):
         i = self.idx.long()

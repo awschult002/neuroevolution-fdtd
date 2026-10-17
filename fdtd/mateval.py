@@ -1,5 +1,5 @@
 """Training and scoring for the material phase (D2)."""
-import json, time
+import json, os, time
 import torch
 from .matmodel import MaterialNet, BoundMaterialStepper, tied_step
 from .rollout import rollout
@@ -20,8 +20,14 @@ def load_mat(name):
 
 
 def base_kernel(r):
+    """Tuned fixed vacuum stencil of radius r from the family (free or D4) that set the bar
+    (runs/mat_bar.json); free family if no bar has been frozen yet."""
     k = 2 * r + 1
-    w = json.load(open("runs/baselines_v2.json"))[f"fixed_r{r}"]["kernel"]
+    family = json.load(open("runs/mat_bar.json"))["family"] if os.path.exists("runs/mat_bar.json") else "fixed"
+    if family == "d4":
+        w = json.load(open("runs/d4_vs_free.json"))[f"d4_r{r}"]["kernel"]
+    else:
+        w = json.load(open("runs/baselines_v2.json"))[f"fixed_r{r}"]["kernel"]
     return torch.tensor(w)[0].view(2, k * k)
 
 
@@ -43,7 +49,8 @@ def score(stepper, split, sel=slice(None), n_steps=5000):
         k = split["steps"].index(s)
         ok = s in r["records"]
         out[f"err{s}"] = rel_l2(r["records"][s], truth[:, k]) if ok else float("nan")
-        out[f"ierr{s}"] = rel_l2(r["records"][s], truth[:, k], mask) if ok else float("nan")
+        out[f"ierr{s}"] = rel_l2(r["records"][s], truth[:, k], mask) if ok else float("nan")   # +-2-cell edge band
+        out[f"berr{s}"] = rel_l2(r["records"][s], truth[:, k], ~mask) if ok else float("nan")  # bulk
     return out
 
 
@@ -96,9 +103,8 @@ def runtime_bytes(net, eps):
     k2 = net.base.shape[1]
     vals, classes = [], []
     for e in eps:
-        uniq, idx = net.classes(e[None])
-        n_cls = len(uniq)
-        vals.append(FIELD_BYTES + idx.element_size() + n_cls * (2 * k2 + 1) * 4 / e.numel())
+        _, _, _, cls, n_cls = net.classes(e[None])
+        vals.append(FIELD_BYTES + cls.element_size() + n_cls * (2 * k2 + 1) * 4 / e.numel())
         classes.append(n_cls)
     return sum(vals) / len(vals), max(classes)
 

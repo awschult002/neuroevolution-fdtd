@@ -28,6 +28,29 @@ def random_scene(rng, shapes="rect"):
     return {"kind": "scene", "blocks": blocks, "pulses": pulses}
 
 
+def extra_test_scenes(rng):
+    """T-MAT-3: geometries outside training. 2 scenes with contrast above the training range
+    (eps 10-12), 2 with a thin strip exactly one coarse cell wide, 2 whose block edges sit exactly
+    mid-cell on the 64^2 grid."""
+    out = []
+    for kind in ("high_contrast", "high_contrast", "thin", "thin", "midcell", "midcell"):
+        sc = random_scene(rng)
+        if kind == "high_contrast":
+            for b in sc["blocks"]:
+                b["eps"] = rng.uniform(10.0, 12.0)
+        elif kind == "thin":
+            sc["blocks"][0].update(hx=0.5 / 64, hy=rng.uniform(10, 20) / 64)
+        else:
+            for b in sc["blocks"]:
+                b["cx"] = (round(b["cx"] * 64) + 0.5) / 64
+                b["hx"] = round(b["hx"] * 64) / 64       # edges at cx +- hx = half-integer cells
+                b["cy"] = (round(b["cy"] * 64) + 0.5) / 64
+                b["hy"] = round(b["hy"] * 64) / 64
+        sc["test_kind"] = kind
+        out.append(sc)
+    return out
+
+
 def _delta(c, centre):
     return torch.remainder(c - centre + 0.5, 1.0) - 0.5
 
@@ -58,10 +81,11 @@ def average(field, f):
     return field.reshape(b, n // f, f, n // f, f).mean(dim=(2, 4))
 
 
-def interface_mask(eps_fine, f):
-    """Coarse cells whose 3x3 coarse neighbourhood contains any eps variation on the fine grid."""
+def interface_mask(eps_fine, f, band=2):
+    """T-MAT-4 edge band: coarse cells within +-band coarse cells of any cell whose fine eps varies."""
     mx = torch.nn.functional.max_pool2d(eps_fine[:, None], f)
     mn = -torch.nn.functional.max_pool2d(-eps_fine[:, None], f)
     var = (mx - mn) > 1e-6
-    var = torch.nn.functional.max_pool2d(torch.nn.functional.pad(var.float(), (1, 1, 1, 1), mode="circular"), 3, stride=1)
+    var = torch.nn.functional.max_pool2d(torch.nn.functional.pad(var.float(), (band,) * 4, mode="circular"),
+                                         2 * band + 1, stride=1)
     return var[:, 0] > 0
