@@ -1,4 +1,4 @@
-"""Stage 8 (D2): material-scene dataset. 200 rectangle scenes -> 150 train / 25 val / 25 test, plus
+"""Stage 8 (D2): material-scene dataset (superseded truth: s8d_truth2048.py replaces it with 2048^2). 200 rectangle scenes -> 150 train / 25 val / 25 test, plus
 10 unseen-shape test scenes (rotated rectangles, L-shapes). Truth = Yee 512^2 with point-sampled eps,
 restricted to 64^2; Yee 128^2 / 256^2 use eps averaged from the 512^2 samples. Coarse eps = 8x8 average.
 Writes data/mat_train.pt, data/mat_val.pt, data/mat_test.pt."""

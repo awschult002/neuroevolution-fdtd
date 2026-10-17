@@ -4,11 +4,20 @@ from .yee import COURANT, yee_step
 from .restrict import restrict_state
 
 
+_compiled_step = None
+
+
 @torch.no_grad()
-def run_fine_restricted(ez, inv_eps, factor, record_steps):
+def run_fine_restricted(ez, inv_eps, factor, record_steps, compiled=False):
     """ez: (B, n, n) initial Ez on the fine grid; H is zero at t=0.
     Yee needs H at -dt/2, so we take a backward half step (second-order consistent start).
     Returns (B, len(record_steps), 3, n/f, n/f) coarse states (Ez at t, H at t+T/2)."""
+    global _compiled_step
+    step_fn = yee_step
+    if compiled:                                       # fused Triton kernels, ~10x faster on big grids
+        if _compiled_step is None:
+            _compiled_step = torch.compile(yee_step)
+        step_fn = _compiled_step
     hx = 0.5 * COURANT * (torch.roll(ez, -1, dims=-1) - ez)
     hy = -0.5 * COURANT * (torch.roll(ez, -1, dims=-2) - ez)
     record_steps = sorted(record_steps)
@@ -17,7 +26,7 @@ def run_fine_restricted(ez, inv_eps, factor, record_steps):
         ez_start = ez
         h_a = h_b = None
         for k in range(factor):
-            ez, hx, hy = yee_step(ez, hx, hy, inv_eps)
+            ez, hx, hy = step_fn(ez, hx, hy, inv_eps)
             if factor == 1:            # no restriction in time: H after the step is at t+T/2
                 h_a = h_b = (hx, hy)
             elif k == factor // 2 - 1:
