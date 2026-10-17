@@ -66,11 +66,11 @@ def mutate(design, rng):
 
 
 def patches(field, r):
-    """(B, n, n) -> (B, k*k, n, n); entry (dx+r)*k + (dy+r) is field[i+dx, j+dy], periodic."""
-    b, n, _ = field.shape
+    """(B, h, w) -> (B, k*k, h, w); entry (dx+r)*k + (dy+r) is field[i+dx, j+dy], periodic."""
+    b, h, w = field.shape
     k = 2 * r + 1
     padded = F.pad(field[:, None], (r, r, r, r), mode="circular")
-    return F.unfold(padded, k).view(b, k * k, n, n)
+    return F.unfold(padded, k).view(b, k * k, h, w)
 
 
 def apply_transpose(coeffs, field, r):
@@ -141,6 +141,86 @@ class LearnedStepper(nn.Module):
         hy = hy - COURANT * apply_transpose(a[:, 0], ez, r)
         hx = hx - COURANT * apply_transpose(a[:, 1], ez, r)
         return ez, hx, hy
+
+
+def periodic_fold(y, r):
+    """Wrap the r-wide border of a full conv_transpose2d output back onto the periodic grid."""
+    y = y.clone()
+    y[..., r:2 * r, :] += y[..., -r:, :]
+    y[..., -2 * r:-r, :] += y[..., :r, :]
+    y = y[..., r:-r, :]
+    y[..., :, r:2 * r] += y[..., :, -r:]
+    y[..., :, -2 * r:-r] += y[..., :, :r]
+    return y[..., :, r:-r]
+
+
+def consistency_projector(r):
+    """Projector onto stencil changes that keep the moment conditions of Yee's curl stencils:
+    A1 (on Hy, at x-offset dx+1/2):  sum w = 0,  sum w (dx+1/2) = 1,  sum w dy = 0
+    A2 (on Hx, at y-offset dy+1/2):  sum w = 0,  sum w (dy+1/2) = -1, sum w dx = 0
+    i.e. sum_j w_j (j+1/2) = 1/dx (grid units). Yee satisfies them, so learned = Yee + P delta does too."""
+    k = 2 * r + 1
+    off = torch.arange(-r, r + 1, dtype=torch.float64)
+    dx, dy = torch.meshgrid(off, off, indexing="ij")
+    rows = []
+    for normal, tangent in ((dx, dy), (dy, dx)):
+        c = torch.stack([torch.ones(k * k, dtype=torch.float64), (normal + 0.5).flatten(), tangent.flatten()])
+        rows.append(torch.eye(k * k, dtype=torch.float64) - c.T @ torch.linalg.solve(c @ c.T, c))
+    return torch.stack(rows).float()                    # (2, k*k, k*k)
+
+
+class FixedLinearStepper(nn.Module):
+    """Coefficients fixed in time (the 'guaranteed' arm): two constant curl stencils A1, A2 of
+    radius r, consistent (see consistency_projector). E step: conv2d of (Hy, Hx) with the kernel;
+    H step: conv_transpose2d of Ez with the SAME kernel (the exact adjoint), so the staggered
+    energy is conserved to roundoff. No penalty term."""
+
+    def __init__(self, radius):
+        super().__init__()
+        self.radius = radius
+        k = 2 * radius + 1
+        self.register_buffer("yee", yee_stencils(radius)[:2].clone())
+        self.register_buffer("proj", consistency_projector(radius))
+        self.delta = nn.Parameter(torch.zeros(2, k * k))
+
+    def kernel(self):
+        k = 2 * self.radius + 1
+        w = self.yee + torch.einsum("cij,cj->ci", self.proj, self.delta)
+        return w.view(1, 2, k, k)
+
+    def step(self, ez, hx, hy, inv_eps):
+        r, w = self.radius, self.kernel()
+        h = F.pad(torch.stack([hy, hx], dim=1), (r, r, r, r), mode="circular")
+        ez = ez + COURANT * inv_eps * F.conv2d(h, w)[:, 0]
+        t = periodic_fold(F.conv_transpose2d(ez[:, None], w), r)
+        return ez, hx - COURANT * t[:, 1], hy - COURANT * t[:, 0]
+
+    def sigma_max(self, n=64):
+        """max_k |C_hat(k)| of the curl operator on the periodic n^2 grid, by FFT (grid units)."""
+        r, w = self.radius, self.kernel().detach()[0].double().cpu()
+        total = torch.zeros(n, n, dtype=torch.float64)
+        for c in range(2):
+            full = torch.zeros(n, n, dtype=torch.float64)
+            for a in range(2 * r + 1):
+                for b in range(2 * r + 1):
+                    full[(a - r) % n, (b - r) % n] = w[c, a, b]
+            total += torch.fft.fft2(full).abs() ** 2
+        return total.sqrt().max().item()
+
+    def stable(self):
+        """Leapfrog stability at the coarse (4x) dt: dt*sigma_max < 2 sqrt(eps mu), eps = mu = 1."""
+        return COURANT * self.sigma_max() < 2.0
+
+    def rescale_to_stable(self, margin=0.98):
+        """Scale the kernel down so COURANT*sigma_max = margin*2. Returns the factor (1.0 if none)."""
+        cn = COURANT * self.sigma_max()
+        if cn < 2.0:
+            return 1.0
+        f = margin * 2.0 / cn
+        with torch.no_grad():                            # w -> f*w, written back into delta
+            w = self.kernel()[0].view(2, -1) * f
+            self.delta.copy_(w - self.yee)              # note: scaling breaks the consistency moment
+        return f
 
 
 def parameter_count(model):

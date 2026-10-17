@@ -26,8 +26,14 @@ def yee_step(ez, hx, hy, inv_eps):
     return ez, hx, hy
 
 
-def energy(ez, hx, hy, eps):
-    """The ONE discrete energy used everywhere: U = 1/2 * sum(eps Ez^2 + Hx^2 + Hy^2) h^2.
-    (H is half a step offset from Ez; this standard formula therefore wiggles at O(dt)
-    even for exact Yee, which is why Yee's own drift is reported as the yardstick.)"""
+def energy(ez, h_prev, h_next, eps):
+    """The ONE discrete energy used by every method and by the 1% gate (staggered leapfrog energy):
+        U_n = 1/2 * sum(eps * Ez^n^2 + H^(n-1/2) . H^(n+1/2)) * h^2      (mu = 1)
+    h_prev = (Hx, Hy) at n-1/2, h_next = (Hx, Hy) at n+1/2. For any leapfrog of the form
+    E += C*inv_eps*A H, H -= C*A^T E with A fixed in time (Yee included) U_n is conserved to roundoff."""
+    return 0.5 * (eps * ez * ez + h_prev[0] * h_next[0] + h_prev[1] * h_next[1]).mean(dim=(-2, -1))
+
+
+def naive_energy(ez, hx, hy, eps):
+    """1/2 sum(eps Ez^2 + Hx^2 + Hy^2) with H half a step off. Reported for information only."""
     return 0.5 * (eps * ez * ez + hx * hx + hy * hy).mean(dim=(-2, -1))

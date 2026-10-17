@@ -1,39 +1,32 @@
-"""Stage 0 (Tester condition b): does the tied update conserve energy?
-20,000 coarse steps on 64^2, 5 pulse ICs from the validation set.
-  1. plain Yee
-  2. tied stencil, radius 2, random FIXED spatially varying coefficients (Yee + 0.05*noise)
-  3. tied stencil whose coefficients come from a random untrained MLP (state-dependent,
-     recomputed once per step; last layer scaled so the perturbation is ~0.05)
-Reports, at 5k and 20k steps, relative drift |U-U0|/U0 of
-  - U_shared: the one shared energy formula (fdtd/yee.py), used by the 1% gate
-  - U_mod   : 1/2 sum(eps Ez^(n+1)^2 + H^(n+1/2).H^(n+3/2)), the quantity the tied leapfrog conserves
-              (proof: with E += C A H, H -= C A^T E, the cross terms cancel step to step)
-Writes runs/conservation.json."""
+"""Stage 0 (Tester b / Oracle 6): unit check of energy conservation, 20,000 coarse steps on 64^2,
+5 validation pulse ICs. Three runs:
+  yee            plain Yee
+  fixed_random   FixedLinearStepper(r=2), random constant consistent stencils (Yee + P*0.05*noise),
+                 conv2d / conv_transpose2d with one kernel: expected drift at fp32 roundoff
+  field_mlp      tied LearnedStepper(r=2, 2x16 tanh) with a random untrained MLP (coefficients depend
+                 on the fields, recomputed every step): expected to drift
+Drift = |U_N - U_1| / U_1 (max over ICs) for the staggered energy (the gate) and, for information,
+the naive energy. Writes runs/conservation.json."""
 import json, torch
-from fdtd.model import Design, LearnedStepper, YeeStepper
-from fdtd.yee import energy
+from fdtd.model import Design, FixedLinearStepper, LearnedStepper, YeeStepper
+from fdtd.yee import energy, naive_energy
 from fdtd.evaluate import load_split
 
-STEPS, R = 20000, 2
+STEPS = 20000
 
 
-class FixedTied:
-    def __init__(self, n, seed):
-        g = torch.Generator(device="cuda").manual_seed(seed)
-        self.model = LearnedStepper(Design(R, 1, 4, "tanh", "tied")).cuda()
-        k2 = (2 * R + 1) ** 2
-        self.a = self.model.yee[:, :2] + 0.05 * torch.randn(1, 2, k2, n, n, device="cuda", generator=g)
-
-    def step(self, ez, hx, hy, inv_eps):
-        return self.model.tied_update(ez, hx, hy, inv_eps, self.a.expand(ez.shape[0], -1, -1, -1, -1))
-
-
-def mlp_tied(seed):
+def fixed_random(seed):
     torch.manual_seed(seed)
-    m = LearnedStepper(Design(R, 2, 16, "tanh", "tied")).cuda()
-    last = m.net[-1]
-    torch.nn.init.normal_(last.weight, std=0.05 / 4)
-    torch.nn.init.zeros_(last.bias)
+    m = FixedLinearStepper(2).cuda()
+    with torch.no_grad():
+        m.delta.normal_(std=0.05)
+    return m
+
+
+def field_mlp(seed):
+    torch.manual_seed(seed)
+    m = LearnedStepper(Design(2, 2, 16, "tanh", "tied")).cuda()
+    torch.nn.init.normal_(m.net[-1].weight, std=0.05 / 4)
     return m
 
 
@@ -42,33 +35,30 @@ def run(stepper, state):
     ez, hx, hy = state[:, 0], state[:, 1], state[:, 2]
     ones = torch.ones_like(ez)
     step = torch.compile(stepper.step)
-    h_prev = None
-    out = {}
-    u_shared0 = energy(ez, hx, hy, ones)
-    u_mod0 = None
-    for n in range(STEPS + 1):
-        ez_n, hx_n, hy_n = ez, hx, hy
+    out, u1, v1 = {}, None, None
+    for m in range(1, STEPS + 1):
+        h_prev = (hx, hy)
         ez, hx, hy = step(ez, hx, hy, 1.0)
-        # state at n holds Ez^n, H^(n+1/2); after the step Ez^(n+1), H^(n+3/2)
-        u_mod = 0.5 * (ez * ez + hx_n * hx + hy_n * hy).mean(dim=(-2, -1))
-        if n == 0:
-            u_mod0 = u_mod
-        if n in (5000, STEPS):
-            u_sh = energy(ez_n, hx_n, hy_n, ones)
-            out[n] = {"shared": ((u_sh - u_shared0).abs() / u_shared0).max().item(),
-                      "mod": ((u_mod - u_mod0).abs() / u_mod0).max().item(),
-                      "finite": bool(torch.isfinite(u_sh).all())}
+        if m == 1 or m in (5000, STEPS):
+            u = energy(ez, h_prev, (hx, hy), ones)
+            v = naive_energy(ez, hx, hy, ones)
+            if m == 1:
+                u1, v1 = u, v
+            else:
+                out[m] = {"staggered": ((u - u1).abs() / u1).max().item(),
+                          "naive": ((v - v1).abs() / v1).max().item(),
+                          "finite": bool(torch.isfinite(u).all())}
     return out
 
 
 def main():
-    val = load_split("val")
-    state = val["yee512"][:5, 0]
-    res = {"yee": run(YeeStepper(), state),
-           "tied_fixed_random": run(FixedTied(64, 0), state),
-           "tied_mlp_random": run(mlp_tied(0), state)}
+    state = load_split("val")["yee512"][:5, 0]
+    res = {"yee": run(YeeStepper(), state)}
+    m = fixed_random(0)
+    res["fixed_random"] = dict(run(m, state), courant_sigma=0.5 * m.sigma_max())
+    res["field_mlp"] = run(field_mlp(0), state)
     for k, v in res.items():
-        print(k, json.dumps(v))
+        print(k, json.dumps(v), flush=True)
     json.dump(res, open("runs/conservation.json", "w"), indent=1)
 
 
