@@ -1,0 +1,9 @@
+.venv/
+data/
+runs/
+logs/
+*.pt
+*.npy
+*.npz
+nvidia-smi*.log
+__pycache__/
