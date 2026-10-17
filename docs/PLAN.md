@@ -17,6 +17,8 @@ Find out whether a small learned correction lets a coarse 2D TMz Yee FDTD grid m
 - Cost measured as time and bytes moved per step, not FLOPs (the step is memory-bound).
 - **Stability gate:** a candidate must survive 20,000 steps without blowing up to count.
 
+The numbered gates (T-REF, T-STAB, T-TIME, T-KILL, ...) are defined in [TEST_SPEC.md](TEST_SPEC.md).
+
 ## Fairness and timing rules
 - Timing grids are 4096² fine vs 1024² coarse, well beyond the GPU's ~1 MB L2, so cache effects don't flatter small grids.
 - Everything is timed in fp32 unless every method switches precision together.
@@ -38,6 +40,21 @@ If no searched candidate beats plain 256² Yee on error at lower measured cost, 
 | Work dir | `~/fdtd-neuroevo` |
 
 Each result also records GPU clock, temperature, power state and commit hash.
+
+## Results log
+
+### R1: random search vs hand-picked baseline (2026-10-17, harness `afc9bef`)
+- 48 random designs plus the hand-picked Bar-Sinai net: **all failed the 1% energy gate.** None blew up, but all gain energy steadily (hand-picked net: +32.7% over 5,000 steps).
+- Stencil-coefficient models beat coarse Yee on error at 1,000 steps (best 0.134 vs 0.240), but the lowest drift among them is 3%, and by 5,000 steps the gap mostly closes (0.62 vs 0.66).
+- Direct-correction models drift 150–440% and are dropped.
+- Plain 256² Yee is 7–30× more accurate than any coarse model. **Kill criterion currently points to no win.**
+- The evolution run is not a valid comparison yet: every fitness is infinite, so parent selection is random.
+- Timing not run yet: the GPU was shared with `bitfeat` jobs.
+
+## Deviations from plan
+
+### D1 (proposed, awaiting Oracle/Senior review and Alex): structural energy conservation
+Tie each learned E-update stencil to the negative adjoint of its H-update partner so the discrete curl pair stays skew-symmetric, conserving the shared discrete energy exactly as Yee does. Then rerun random search vs evolution on the same budget (~2 GPU-hours). Alternative: write up R1 as the negative result.
 
 ## Claims and sources
 - Learned discretizations for coarse grids: Bar-Sinai et al., *Learning data-driven discretizations for partial differential equations*, PNAS 2019, [arXiv:1808.04930](https://arxiv.org/abs/1808.04930).
