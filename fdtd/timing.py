@@ -4,10 +4,10 @@ torch.compile (Inductor) turns the Yee step into fused Triton kernels; for learn
 elementwise/stencil work is fused but each conv stays a separate cuDNN call, so a learned step is
 a handful of kernels, not one (a documented deviation from T-TIME-1).
 Each run: 50 steps; SM clock + temperature read from nvidia-smi right after the run. A run whose
-clock is >10% below the warm-up clock is discarded and repeated (up to 10 extra tries).
+clock is >10% below the warm-up clock, or during which another process uses the GPU, is discarded and repeated (up to 10 extra tries).
 Result = median of 5 valid runs.
 """
-import statistics, subprocess, time
+import os, statistics, subprocess, time
 import torch
 from .yee import COURANT
 
@@ -16,6 +16,12 @@ def gpu_clock_and_temp():
     out = subprocess.run(["nvidia-smi", "--query-gpu=clocks.sm,temperature.gpu", "--format=csv,noheader,nounits"],
                          capture_output=True, text=True).stdout.strip().split(",")
     return int(out[0]), int(out[1])
+
+
+def other_gpu_processes():
+    out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+                         capture_output=True, text=True).stdout.split()
+    return [int(p) for p in out if int(p) != os.getpid()]
 
 
 def warm_up(seconds=30.0):
@@ -44,8 +50,9 @@ def seconds_per_step(stepper, n, warm_clock, steps=50, valid_runs=5):
         torch.cuda.synchronize()
         dt = (time.perf_counter() - t0) / steps
         clock, temp = gpu_clock_and_temp()
-        valid = clock >= 0.9 * warm_clock
-        log.append({"s_per_step": dt, "sm_clock": clock, "temp_c": temp, "valid": valid})
+        others = other_gpu_processes()
+        valid = clock >= 0.9 * warm_clock and not others
+        log.append({"s_per_step": dt, "sm_clock": clock, "temp_c": temp, "other_gpu_pids": others, "valid": valid})
         if valid:
             runs.append(dt)
         if len(runs) == valid_runs:

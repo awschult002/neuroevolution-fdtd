@@ -10,7 +10,8 @@ unique patches (exact hashing of the network INPUT, no clustering), run the MLP 
 pattern, and store a per-cell class index (uint8, uint16 if > 255 classes). Per pattern the MLP gives
   - "C": a consistent correction to the base stencils (base = tuned fixed vacuum stencil of radius r)
   - "M": a positive factor on the cell-averaged eps: M_eps = eps_avg * softplus(o)/softplus(0)
-The last layer is zero-initialised, so an untrained network equals baseline (ii)."""
+The last layer is zero-initialised, so an untrained network equals baseline (ii). Bulk cells (uniform
+eps patch) always get the base stencil and M = eps exactly; the network only acts near interfaces."""
 import itertools, math
 from dataclasses import dataclass, replace
 
@@ -22,7 +23,7 @@ from .model import ACTIVATIONS, apply_transpose, consistency_projector, patches
 from .yee import COURANT
 
 SPACE = {
-    "eps_radius": (0, 1, 2),
+    "eps_radius": (1, 2, 3),
     "layers": (1, 2, 3),
     "width": (4, 8, 16, 32),
     "activation": ("tanh", "relu", "silu"),
@@ -90,6 +91,9 @@ class MaterialNet(nn.Module):
     def table(self, uniq):
         """Per-class stencils (n, 2, k*k) and M factors (n,)."""
         out = self.mlp(uniq)
+        # bulk rule: a uniform eps patch (vacuum or inside one material) gets exactly the base stencil
+        interface = ((uniq.max(dim=1).values - uniq.min(dim=1).values) > 0).float()[:, None]
+        out = out * interface
         k2 = self.base.shape[1]
         da = out[:, :2 * k2].view(-1, 2, k2)
         if "C" not in self.design.outputs:
@@ -134,3 +138,25 @@ class BoundMaterialStepper:
             sig = z.flatten(1).norm(dim=1).sqrt()                       # ||G G^T x|| -> sigma^2
             x = z
         return sig                                                       # (B,)
+
+
+class IndexedMaterialStepper:
+    """Runtime form used for timing: per-cell class index (uint8/int16) + weight table; the stencil
+    is gathered from the table inside the compiled step instead of being stored per cell."""
+
+    def __init__(self, net, eps):
+        with torch.no_grad():
+            uniq, idx = net.classes(eps)
+            a_tab, f_tab = net.table(uniq)
+        self.r = net.design.stencil_radius
+        self.idx = idx
+        self.a_tab = a_tab.contiguous()
+        self.inv_m_tab = f_tab.contiguous()
+        self.inv_eps = 1.0 / eps
+        self.n_classes = len(uniq)
+
+    def step(self, ez, hx, hy, inv_eps):
+        i = self.idx.long()
+        a = self.a_tab[i].permute(0, 3, 4, 1, 2)
+        inv_m = self.inv_eps / self.inv_m_tab[i]
+        return tied_step(ez, hx, hy, a, inv_m, self.r)

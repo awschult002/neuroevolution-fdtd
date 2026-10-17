@@ -52,7 +52,9 @@ def feasible(sc):
             and all(sc[k] == sc[k] for k in ("err1000", "err5000")))
 
 
-def train_net(net, traj, eps, steps=TRAIN_STEPS, batch=TRAIN_BATCH, unroll=UNROLL, lr=1e-3, seed=0):
+def train_net(net, traj, eps, mask, steps=TRAIN_STEPS, batch=TRAIN_BATCH, unroll=UNROLL, lr=1e-3, seed=0):
+    """Loss per unrolled step = relative MSE over all cells + relative MSE over interface cells
+    (interfaces are ~13% of cells and are what the network is for)."""
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(seed)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -66,12 +68,14 @@ def train_net(net, traj, eps, steps=TRAIN_STEPS, batch=TRAIN_BATCH, unroll=UNROL
         t = torch.randint(n_t - unroll, (batch,), generator=gen)
         window = traj[i[:, None], t[:, None] + torch.arange(unroll + 1)].to(DEV, non_blocking=True)
         a, inv_m, _, _ = net.setup(eps[i].to(DEV))
+        m = mask[i].to(DEV)[:, None].float()
         ez, hx, hy = window[:, 0, 0], window[:, 0, 1], window[:, 0, 2]
         loss = 0.0
         for u in range(1, unroll + 1):
             ez, hx, hy = step(ez, hx, hy, a, inv_m, r)
             target = window[:, u]
-            loss = loss + ((torch.stack([ez, hx, hy], 1) - target) ** 2).mean() / (target ** 2).mean()
+            err2 = (torch.stack([ez, hx, hy], 1) - target) ** 2
+            loss = loss + err2.mean() / (target ** 2).mean() + (err2 * m).sum() / ((target ** 2) * m).sum().clamp_min(1e-12)
         loss = loss / unroll
         if not torch.isfinite(loss):
             return float("nan")
@@ -106,9 +110,10 @@ def bind(net, eps):
 
 
 def train_and_score(design, train, val, seed=0, steps=TRAIN_STEPS):
+    torch._dynamo.reset()                 # fresh compile cache per candidate (avoids recompile limit)
     t0 = time.time()
     net = MaterialNet(design, base_kernel(design.stencil_radius)).to(DEV)
-    loss = train_net(net, train["traj"], train["eps"], steps=steps, seed=seed)
+    loss = train_net(net, train["traj"], train["eps"], train["mask"], steps=steps, seed=seed)
     torch.cuda.synchronize()
     train_s = time.time() - t0
     net.eval()

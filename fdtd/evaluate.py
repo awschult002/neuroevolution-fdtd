@@ -39,6 +39,7 @@ def feasible(score):
 
 
 def train_and_score(design, traj, val, train_steps, seed=0):
+    torch._dynamo.reset()                 # fresh compile cache per candidate (avoids recompile limit)
     t0 = time.time()
     model = LearnedStepper(design).to(DEV)
     loss = train_model(model, traj, train_steps, batch=TRAIN_BATCH, seed=seed)
