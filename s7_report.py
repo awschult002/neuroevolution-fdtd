@@ -119,7 +119,7 @@ for e in final["front"]:
 
 # ---------- timing + rank correlation
 front_names = [e["name"] for e in final["front"]]
-learned = [n for n in timing if not n.startswith("yee")]
+learned = [n for n in timing if not n.startswith(("yee", "_"))]
 est = {}
 for recs in list(search.values()) + [[hand]]:
     for r in recs:

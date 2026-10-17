@@ -47,7 +47,16 @@ def main():
             if design in pool:
                 pool.remove(design)
         t0 = time.time()
-        rec, _ = train_and_score(design, traj, val, train_steps)
+        for attempt in range(60):       # the GPU is shared with other jobs: wait out OOMs
+            try:
+                rec, _ = train_and_score(design, traj, val, train_steps)
+                break
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print(f"OOM on {design.name()}, retrying in 60 s", flush=True)
+                time.sleep(60)
+        else:
+            raise RuntimeError("GPU memory never became available")
         rec["index"] = len(done)
         rec["wall_s"] = time.time() - t0
         done.append(rec)
