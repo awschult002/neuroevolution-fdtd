@@ -35,7 +35,7 @@ def score_stepper(stepper, split, n_steps=5000, select=None):
 
 def feasible(score):
     return (score["blew_up_at"] is None and score["drift_mean"] < DRIFT_LIMIT
-            and all(score[k] == score[k] for k in ("err100", "err1000", "err5000")))
+            and all(v == v for k, v in score.items() if k.startswith("err")))
 
 
 def train_and_score(design, traj, val, train_steps, seed=0):

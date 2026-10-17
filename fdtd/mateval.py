@@ -7,7 +7,9 @@ from .yee import COURANT
 
 DEV = "cuda"
 DRIFT_LIMIT = 0.01
-TRAIN_STEPS, TRAIN_BATCH, UNROLL = 500, 8, 8
+TRAIN_STEPS, TRAIN_BATCH = 500, 8
+# training unroll: chosen once by s10a_unroll_test.py (8 vs 32) and used identically by both search arms
+UNROLL = json.load(open("runs/unroll_choice.json"))["unroll"] if os.path.exists("runs/unroll_choice.json") else 8
 FIELD_BYTES = 24          # read Ez,Hx,Hy + write Ez,Hx,Hy, fp32
 
 
@@ -20,15 +22,9 @@ def load_mat(name):
 
 
 def base_kernel(r):
-    """Tuned fixed vacuum stencil of radius r from the family (free or D4) that set the bar
-    (runs/mat_bar.json); free family if no bar has been frozen yet."""
-    k = 2 * r + 1
-    family = json.load(open("runs/mat_bar.json"))["family"] if os.path.exists("runs/mat_bar.json") else "fixed"
-    if family == "d4":
-        w = json.load(open("runs/d4_vs_free.json"))[f"d4_r{r}"]["kernel"]
-    else:
-        w = json.load(open("runs/baselines_v2.json"))[f"fixed_r{r}"]["kernel"]
-    return torch.tensor(w)[0].view(2, k * k)
+    """Base stencil (2, k*k) of radius r for the networks: the frozen bar's stencil at its radius,
+    the same family at other radii (runs/mat_bar.json, written by s9_mat_baselines.py val)."""
+    return torch.tensor(json.load(open("runs/mat_bar.json"))["kernels"][str(r)])
 
 
 def rel_l2(pred, true, mask=None):
@@ -56,7 +52,7 @@ def score(stepper, split, sel=slice(None), n_steps=5000):
 
 def feasible(sc):
     return (sc["blew_up_at"] is None and sc["drift_mean"] < DRIFT_LIMIT
-            and all(sc[k] == sc[k] for k in ("err1000", "err5000")))
+            and all(v == v for k, v in sc.items() if k.startswith("err")))
 
 
 def train_net(net, traj, eps, mask, steps=TRAIN_STEPS, batch=TRAIN_BATCH, unroll=UNROLL, lr=1e-3, seed=0):

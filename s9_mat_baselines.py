@@ -9,6 +9,7 @@ with the lowest validation edge-band err@1000; its family (free or D4) also prov
 base stencils. Writes runs/mat_baselines.json (+ runs/mat_bar.json)."""
 import json, sys, torch
 from fdtd.mateval import load_mat, score, rel_l2
+from fdtd.dispersion import dispersion_table
 from fdtd.model import YeeStepper, FixedLinearStepper, D4FixedStepper
 
 
@@ -21,10 +22,19 @@ def fixed(r):
     return m.eval()
 
 
-def d4(r):
+def d4(r, variant="d4"):
+    """variant: "d4" (rollout-trained, s3d) or "d4fitl2" / "d4fitmm" (closed-form dispersion fits, r=2)."""
     m = D4FixedStepper(r).cuda()
-    m.load_state_dict(torch.load(f"runs/d4_r{r}.pt"))
+    m.load_state_dict(torch.load(f"runs/{variant}_r{r}.pt"))
     return m.eval()
+
+
+def candidate(name):
+    fam, r = name.rsplit("_r", 1)
+    return fixed(int(r)) if fam == "fixed" else d4(int(r), fam)
+
+
+CANDIDATES = [f"{f}_r{r}" for f in ("fixed", "d4") for r in (1, 2, 3)] + ["d4fitl2_r2", "d4fitmm_r2"]
 
 
 def fine(split, n, sel):
@@ -50,16 +60,24 @@ def main():
             res[f"yee64_{tag}"] = score(YeeStepper(), split, sel)
             for n in (128, 256):
                 res[f"yee{n}_{tag}"] = fine(split, n, sel)
-            for r in (1, 2, 3):
-                res[f"fixed_r{r}_{tag}"] = score(fixed(r), split, sel)
-                res[f"d4_r{r}_{tag}"] = score(d4(r), split, sel)
+            for c in CANDIDATES:
+                res[f"{c}_{tag}"] = score(candidate(c), split, sel)
             for k, v in res.items():
                 if k.endswith(tag):
                     print(k, json.dumps(v), flush=True)
     if which == "val":
-        cands = [f"{f}_r{r}" for f in ("fixed", "d4") for r in (1, 2, 3)]
-        best = min(cands, key=lambda c: res[c + "_val"]["ierr1000"])
-        json.dump({"bar": best, "family": best.split("_")[0], "val_ierr1000": res[best + "_val"]["ierr1000"]},
+        for c in CANDIDATES + ["yee64"]:
+            st = YeeStepper() if c == "yee64" else candidate(c)
+            res[f"{c}_dispersion"] = dispersion_table(st)
+            print(c, "phase", {k: round(v["phase_err_per_wavelength"], 4) for k, v in res[f"{c}_dispersion"].items()}, flush=True)
+        best = min(CANDIDATES, key=lambda c: res[c + "_val"]["ierr1000"])
+        fam, r = best.rsplit("_r", 1)
+        # networks of stencil radius q use the bar's stencil if q matches, else the same family at radius q
+        kernels = {}
+        for q in (1, 2, 3):
+            name = best if int(r) == q else ("fixed" if fam == "fixed" else "d4") + f"_r{q}"
+            kernels[q] = candidate(name).kernel().detach().cpu()[0].reshape(2, -1).tolist()
+        json.dump({"bar": best, "val_ierr1000": res[best + "_val"]["ierr1000"], "kernels": kernels},
                   open("runs/mat_bar.json", "w"), indent=1)
         print("BAR", best, res[best + "_val"]["ierr1000"], flush=True)
     json.dump(res, open(path, "w"), indent=1)
